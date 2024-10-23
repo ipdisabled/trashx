@@ -1,0 +1,239 @@
+# encoding:utf-8
+'''
+bak_foot_his:
+https://caipiao.eastmoney.com/Result/History/sfc?page=1
+https://www.lottery.gov.cn/kj/kjlb.html?sfc
+
+bak_foot_train / bak_foot_new:
+(https://cp.zgzcw.com/lottery/getissue.action?lotteryId=300&issueLen=20
+https://cp.zgzcw.com/lottery/zcplayvs.action?lotteryId=13&issue=
+https://fenxi.zgzcw.com/?playid?/bjop)
+
+(https://webapi.sporttery.cn/gateway/lottery/getFootBallMatchV1.qry?param=90,0&sellStatus=0&termLimits=10
+https://www.sporttery.cn/jc/zqdz/index.html?showType=2&mid=1027293)
+
+foot_train / foot_new:
+https://live.500star.com/zucai.php?e=24168
+'''
+import os
+import re
+import time
+import chardet
+import logging
+import requests
+import pandas as pd
+from lxml import etree
+from urllib.parse import urlparse
+from collections import deque,defaultdict
+from typing import List,Dict,Any,Optional
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+pipeline = {
+    'foot_new':{
+        'nodes':[
+            {'id':'matchlist','url':'https://live.500star.com/zucai.php',
+             'func':'fetch_parse_c','output_val':[]},
+            {'id':'odds_list','url':'','func':'fetch_parse_d','output_val':[]},
+            {'id':'sjlist','url':'','func':'fetch_parse_e','output_val':[]},
+            {'id':'sink','url':'','func':'fetch_parse_f','output_val':[]},
+        ],
+        'links':[{'from':'matchlist','to':'odds_list'},
+                 {'from':'matchlist','to':'sjlist'},
+                 {'from':'odds_list','to':'sink'},
+                 {'from':'sjlist','to':'sink'}],
+        'save_conf':{'path':'footnewinfo_data.csv','colname':[]}
+    }
+}
+
+class Fetcher:
+    def __init__(self):
+        self.session = requests.Session()
+        self.session.headers.update({
+            'User-Agent':'Mozilla/5.0 (Windows NT 6.1; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/39.0.2171.95 Safari/537.36 OPR/26.0.1656.60',
+            'Accept':'application/json,text/html,*/*;q=0.9',
+            'Accept-Language':'en-us,en;q=0.9',
+            'Connection': 'keep-alive'
+        })
+
+    def fetch_url(self,url:str,response_type:str,timeout:int=10)->Any:
+        parsed_url = urlparse(url)
+        self.session.headers.update({'Referer':f"{parsed_url.scheme}://{parsed_url.netloc}"})
+        try:
+            logger.info(f"Fetching URL:{url}")
+            response = self.session.get(url,timeout=timeout)
+            time.sleep(6)
+            response.encoding = chardet.detect(response.content)['encoding']
+            response.raise_for_status()
+            if response_type =='json':
+                return response.json()
+            elif response_type =='text':
+                return response.text if response.text else None
+            elif response_type =='html':
+                return etree.HTML(response.text) if response.text else None
+        except requests.Timeout:
+            logger.error(f"请求超时：{url}")
+        except requests.RequestException as e:
+            logger.error(f"请求发生错误:{e}")
+        return None
+
+class Parser:
+
+    def create_multiindex_df(self,data,columns,indexname):
+        df = pd.DataFrame(data,index=indexname,columns=columns)
+        new_columns = pd.MultiIndex.from_product([df.columns,indexname])
+        new_df = pd.DataFrame(columns=new_columns)
+        for idx,index in enumerate(indexname):
+            new_df.loc[0,(slice(None),index)] = df.iloc[idx].values
+        return new_df
+    
+    def ftext(self,element):
+        return ''.join(element.itertext()).strip()
+
+class SNode:
+    def __init__(self,id:str,url:str,func:str,output_val=None,save_conf=None):
+        self.id = id
+        self.url = url
+        self.pfunc = func
+        self.input = []
+        self.output = output_val
+        self.path = save_conf.get('path') if save_conf else None
+        self.colname =  save_conf.get('colname') if save_conf else None
+    
+    def execute(self):
+        func = getattr(self,self.pfunc)
+        func(self.input,self.url)
+
+    def fetch_parse_a(self,input,url:str):
+        '''get input +combine url'''
+        data = fetcher.fetch_url(url,'text')
+        len_sp = len(self.colname)
+        if data:
+            str_li = data.strip().split('\n')
+            for str_line in str_li:
+                sp_li = str_line.split()[:len_sp]
+                self.output.append(sp_li)
+            self.save_data(self.output)
+
+    def fetch_parse_b(self,input,baseurl:str):
+        local_df = self.get_local_df()
+        local_li = local_df.values.tolist() if local_df is not None else []
+        need_update = True
+        numpage = 1
+        while need_update:
+            url = f"{baseurl}{numpage}"
+            data = fetcher.fetch_url(url,'json')
+            numpage += 1
+            if not data or numpage > data['value']['pages']:
+                need_update = False
+                break                  
+            for resitem in data['value']['list']:
+                data_string = [resitem['lotteryDrawNum'],resitem['lotteryDrawTime']] + \
+                                resitem['lotteryDrawResult'].split()
+                if local_df is None or int(data_string[0]) > int(local_df.iloc[0,0]):
+                    self.output.append(data_string)
+                else:
+                    need_update =False
+                    break
+        self.output += local_li
+        self.save_data(self.output)
+
+    def fetch_parse_c(self,input,url:str):
+        '''get input +combine url / parse data + output'''
+        data = fetcher.fetch_url(url,'html')
+        if data is not None:
+            row_status0 = data.xpath('//tr[@status="0"]')
+            for row in row_status0:
+                link1,link2= '',''
+                td_elements = row.xpath('td[4]|td[6]|td[8]|td[10]')
+                date_str = parser.ftext(td_elements[0]) if len(td_elements) > 0 else ''
+                host = re.sub(r'\[\d+\]','',parser.ftext(td_elements[1])) if len(td_elements) > 1 else ''
+                guest = re.sub(r'\[\d+\]','',parser.ftext(td_elements[2])) if len(td_elements) > 2 else ''
+                links = td_elements[3].xpath('.//a[contains(text(),"析") or contains(text(),"欧")]') if len(td_elements) > 3 else []
+                if len(links) >1:
+                    link1 = links[0].get('href')
+                    link2 = links[1].get('href')
+                self.output.append((date_str,host,guest,link1,link2))
+            print(self.output)
+
+    def fetch_parse_d(self,input,url:str):
+        pass
+
+    def fetch_parse_e(self,input,url:str):
+        pass
+
+    def fetch_parse_f(self,input,baseurl:str):
+        next_info_df = input[0]
+        self.save_data(next_info_df)
+
+    def get_local_df(self):
+        if self.path and os.path.isfile(self.path):
+            return pd.read_csv(self.path)
+    
+    def save_data(self,in_data):
+        if isinstance(in_data,list):
+            if self.colname and self.path:
+                df = pd.DataFrame(in_data,columns=self.colname)
+                df.to_csv(self.path,index=False)
+        elif isinstance(in_data,pd.DataFrame):
+            in_data.to_csv(self.path,index=False)
+
+class Graph:
+    def __init__(self) -> None:
+        self.graph = defaultdict(list)
+        self.indegree = defaultdict(int)
+    def add_link(self,u:SNode,v:SNode):
+        self.graph[u].append(v)
+        self.indegree[v] += 1
+        self.indegree.setdefault(u,0)
+
+    def bfs(self):
+        queue = deque(node for node in self.indegree if self.indegree[node] == 0)
+        result = []
+        while queue:
+            node = queue.popleft()
+            result.append(node)
+            node.execute()
+            for neighbor in self.graph[node]:
+                neighbor.input.extend(output for output in node.output if output not in neighbor.input)
+                self.indegree[neighbor] -= 1
+                if self.indegree[neighbor] == 0:
+                    queue.append(neighbor)
+        return result
+
+def init_fetcher_parser():
+    global fetcher,parser
+    fetcher = Fetcher()
+    parser = Parser()
+
+def load_graph_from_config(config:Dict[str,Any]):
+    g = Graph()
+    nodes = {node_config['id']:SNode(
+      id=node_config['id'],
+      url=node_config['url'],
+      func=node_config.get('func',None),
+      output_val=node_config.get('output_val',[]),
+      save_conf=config.get('save_conf',{})) 
+      for node_config in config['nodes']
+    }
+    for node in nodes.values():
+        g.indegree[node]
+    for link in config['links']:
+        g.add_link(nodes[link['from']],nodes[link['to']])
+    return g
+
+if __name__ == "__main__":
+    init_fetcher_parser()
+    for key,value in pipeline.items():
+        g = load_graph_from_config(value)
+        if len(g.indegree) == 1:
+            single_node = next(iter(g.indegree))
+            single_node.execute()
+            #logger.info(f'Output:{single_node.output}')
+            logger.info(f'Node Id:{single_node.id}')
+        else:
+            result = g.bfs()
+            for node in result:
+                #logger.info(f'Input:{node.input},Output:{node.output}')
+                logger.info(f'Node Id:{node.id}')
